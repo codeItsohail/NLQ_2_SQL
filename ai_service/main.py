@@ -7,8 +7,6 @@ from urllib.parse import urlparse
 from datetime import datetime
 from fastapi import BackgroundTasks
 import pandas as pd
-import pyodbc
-import mysql.connector
 from fastapi.responses import FileResponse
 from fastapi import Response
 import json
@@ -84,15 +82,26 @@ def build_sqlserver_connection_string(
         )
         return conn_str
 
-# --- Vanna with OpenAI + ChromaDB (local vector store) ---
-class MyVanna122(ChromaDB_VectorStore, OpenAI_Chat):
-    def __init__(self, config=None):
-        if config is None:
-            config = {}
-        config['path'] = config.get('path', './chroma_db')
-        ChromaDB_VectorStore.__init__(self, config=config)
-        OpenAI_Chat.__init__(self, config=config)
+# Get default schema based on database type
+def get_default_schema(db_type: str) -> Optional[str]:
+    """Return the default schema name for the database type.
+    For MySQL we return None because MySQL uses the database (catalog) instead of schemas.
+    """
+    db_type = (db_type or "").lower()
+    if db_type in ("sqlserver", "mssql"):
+        return "dbo"
+    elif db_type in ("postgresql", "postgres"):
+        return "public"
+    elif db_type == "mysql":
+        return None
+    return None
 
+def get_current_database_name(db_url: str) -> Optional[str]:
+    p = parse_db_url(db_url)
+    return p.get("db")
+
+
+# --- Vanna with OpenAI + ChromaDB (local vector store) ---
 class MyVanna(ChromaDB_VectorStore, OpenAI_Chat):
     def __init__(self, config=None):
         if config is None:
@@ -108,7 +117,7 @@ class MyVanna(ChromaDB_VectorStore, OpenAI_Chat):
     def generate_sql(self, question: str):
         if self.system_prompt:
             question = f"{self.system_prompt}\n\nUser question: {question}"
-        return super().generate_sql(question)
+        return super().generate_sql(question , allow_llm_to_see_data = True)
 
     def connect_to_database(self, connection_string: str):
         """Method to connect Vanna to a database."""
@@ -166,9 +175,9 @@ def test_connection(data: ConnectionData):
 
         elif data.db_type.lower() == "mysql":
             if mysql_connector is None:
-                return {"success": False, "error": "MySQL connector not available. Install mysql-connector-python"}
+                return {"success": False, "error": "MySQL connector not available"}
             
-            conn = mysql.connector.connect(
+            conn = mysql_connector.connect(
                 host=data.host,
                 database=data.db_name,
                 user=data.user,
@@ -181,13 +190,13 @@ def test_connection(data: ConnectionData):
 
         elif data.db_type.lower() == "sqlserver":
             if pyodbc_driver is None:
-                return {"success": False, "error": "pyodbc not available. Install pyodbc"}
+                return {"success": False, "error": "pyodbc not available"}
                 
             # Test with pyodbc first
             conn_str = build_sqlserver_connection_string(
                 data.host, data.port, data.db_name, data.user, data.password, use_sqlalchemy=False
             )
-            conn = pyodbc.connect(conn_str, timeout=10)
+            conn = pyodbc_driver.connect(conn_str, timeout=10)
             conn.close()
             
             # Also test SQLAlchemy format for Vanna compatibility
@@ -237,9 +246,68 @@ def _normalize_pg_url(url: str) -> str:
     return url.replace("postgres://", "postgresql://")
 
 def appdb():
+    """Connect to MySQL app database"""
     if not APP_DB_URL:
         raise RuntimeError("APP_DATABASE_URL not set")
-    return psycopg2.connect(_normalize_pg_url(APP_DB_URL), sslmode="require")
+    
+    # Parse MySQL connection string
+    # Handle both mysql:// and mysql+pymysql:// formats
+    url = APP_DB_URL.replace("mysql+pymysql://", "mysql://").replace("mysql+mysqlconnector://", "mysql://")
+    parsed = urlparse(url)
+    
+    # URL decode password if it contains encoded characters
+    password = urllib.parse.unquote(parsed.password) if parsed.password else None
+    
+    # Parse query parameters for SSL and other options
+    query_params = {}
+    if parsed.query:
+        from urllib.parse import parse_qs
+        query_params = parse_qs(parsed.query)
+    
+    # Base connection config
+    conn_config = {
+        'host': parsed.hostname,
+        'port': parsed.port or 3306,
+        'database': parsed.path.lstrip('/'),
+        'user': parsed.username,
+        'password': password,
+        'autocommit': False,
+        'connect_timeout': 10
+    }
+    
+    # Add SSL configuration for Azure MySQL if needed
+    # Azure MySQL typically requires TLS
+    if parsed.hostname and 'mysql.database.azure.com' in parsed.hostname:
+        # Ensure TLS is enabled
+        conn_config['ssl_disabled'] = False
+        # If caller provided a CA bundle, use it; otherwise relax verification to avoid handshake failures
+        if 'ssl_ca' in query_params and query_params['ssl_ca']:
+            conn_config['ssl_ca'] = query_params['ssl_ca'][0]
+            # When a CA is supplied, you may enable verification explicitly
+            conn_config['ssl_verify_cert'] = True
+            conn_config['ssl_verify_identity'] = False
+        else:
+            # No CA provided; require TLS but disable certificate verification to prevent SSL handshake errors
+            conn_config['ssl_verify_cert'] = False
+            conn_config['ssl_verify_identity'] = False
+
+    # First attempt
+    try:
+        return mysql_connector.connect(**conn_config)
+    except Exception as e:
+        # Fallback for SSL/TLS handshake issues (Azure MySQL)
+        fallback = dict(conn_config)
+        fallback['ssl_disabled'] = False
+        fallback['ssl_verify_cert'] = False
+        fallback['ssl_verify_identity'] = False
+        # Prefer TLS 1.2+ explicitly
+        try:
+            fallback['tls_versions'] = ['TLSv1.3', 'TLSv1.2']
+        except Exception:
+            pass
+        # Some environments need pure Python implementation for TLS/SNI handling
+        fallback['use_pure'] = True
+        return mysql_connector.connect(**fallback)
 
 def set_vanna_collection(v, agent_id: str):
     try:
@@ -282,7 +350,7 @@ def connect_target(db_url: str):
     elif p["scheme"] == "mysql":
         if mysql_connector is None:
             raise RuntimeError("MySQL connector not available")
-        return mysql.connector.connect(host=p["host"], port=p["port"], database=p["db"],
+        return mysql_connector.connect(host=p["host"], port=p["port"], database=p["db"],
                                        user=p["user"], password=p["password"], connection_timeout=10)
     elif p["scheme"] == "sqlserver":
         if pyodbc_driver is None:
@@ -290,7 +358,7 @@ def connect_target(db_url: str):
         conn_str = build_sqlserver_connection_string(
             p["host"], p["port"], p["db"], p["user"], p["password"], use_sqlalchemy=False
         )
-        return pyodbc.connect(conn_str, timeout=10)
+        return pyodbc_driver.connect(conn_str, timeout=10)
     raise ValueError(f"Unsupported scheme: {p['scheme']}")
 
 def get_vanna_connection_string(db_url: str) -> str:
@@ -303,24 +371,74 @@ def get_vanna_connection_string(db_url: str) -> str:
     return db_url.replace("postgres://", "postgresql://")
 
 def get_agent(conn, agent_id: str):
-    with conn.cursor() as cur:
-        cur.execute("SELECT id,user_id,name,description,db_url,trained_at FROM ai_agents WHERE id=%s", (agent_id,))
-        r = cur.fetchone()
-    if not r: return None
-    return {"id": r[0], "user_id": r[1], "name": r[2], "description": r[3], "db_url": r[4], "trained_at": r[5]}
+    """Get agent from MySQL database"""
+    cur = conn.cursor(dictionary=True)
+    cur.execute("""
+        SELECT agent_id, user_id, agent_name, agent_description, 
+               create_date, update_date, is_active
+        FROM agent 
+        WHERE agent_id=%s AND is_active=1
+    """, (agent_id,))
+    r = cur.fetchone()
+    cur.close()
+    
+    if not r:
+        return None
+    
+    # Get db_config for this agent
+    cur = conn.cursor(dictionary=True)
+    cur.execute("""
+        SELECT db_type, db_connection_string, db_host, db_name, 
+               db_user, db_pass, db_port
+        FROM db_configs 
+        WHERE agent_id=%s AND is_active=1
+        LIMIT 1
+    """, (agent_id,))
+    db_config = cur.fetchone()
+    cur.close()
+    
+    db_url = None
+    db_type = None
+    if db_config:
+        if db_config['db_connection_string']:
+            db_url = db_config['db_connection_string']
+        else:
+            # Build connection string from components
+            db_type = db_config['db_type']
+            db_url = build_db_url(
+                db_config['db_type'],
+                db_config['db_host'],
+                db_config['db_port'],
+                db_config['db_name'],
+                db_config['db_user'],
+                db_config['db_pass']
+            )
+        db_type = db_config['db_type']
+    
+    return {
+        "id": r['agent_id'],
+        "user_id": r['user_id'],
+        "name": r['agent_name'],
+        "description": r['agent_description'],
+        "db_url": db_url,
+        "trained_at": r['update_date'],  # Using update_date as trained_at
+        "dbtype": db_type
+    }
 
-def info_schema_text(db_url: str) -> str:
-    """Enhanced schema extraction with SQL Server support"""
+def info_schema_text(db_url: str, db_type: str = None) -> str:
+    """Enhanced schema extraction with proper schema detection"""
     p = parse_db_url(db_url)
+    default_schema = get_default_schema(db_type or p["scheme"])
+    
     with connect_target(db_url) as conn:
         cur = conn.cursor()
         if p["scheme"] == "postgresql":
             cur.execute("""
               SELECT table_schema, table_name, column_name, data_type
               FROM information_schema.columns
-              WHERE table_schema NOT IN ('pg_catalog','information_schema')
-              ORDER BY table_schema, table_name, ordinal_position
-            """)
+              WHERE table_schema = %s
+              ORDER BY table_name, ordinal_position
+            """, (default_schema,))
         elif p["scheme"] == "mysql":
             cur.execute("""
               SELECT table_schema, table_name, column_name, data_type
@@ -338,8 +456,9 @@ def info_schema_text(db_url: str) -> str:
               FROM sys.tables t
               INNER JOIN sys.columns c ON t.object_id = c.object_id
               INNER JOIN sys.types ty ON c.user_type_id = ty.user_type_id
+              WHERE SCHEMA_NAME(t.schema_id) = %s
               ORDER BY t.name, c.column_id
-            """)
+            """, (default_schema,))
         rows = cur.fetchall()
     return "\n".join(f"{r[0]}.{r[1]}.{r[2]} {r[3]}" for r in rows)
 
@@ -363,43 +482,6 @@ def run_sql_preview(db_url: str, sql: str, limit: int = 50):
         data = [dict(zip(cols, r)) for r in rows] if cols else []
     return cols, data
 
-def log_exec(conn, agent_id, user_id, question, sql, success, err, row_count, dur_ms):
-    with conn.cursor() as cur:
-        cur.execute("""
-          INSERT INTO execution_logs(agent_id,user_id,question,generated_sql,success,error,row_count,duration_ms)
-          VALUES (%s,%s,%s,%s,%s,%s,%s,%s)
-        """, (agent_id, user_id, question, sql, success, err, row_count, dur_ms))
-    conn.commit()
-
-def ensure_session(conn, agent_id, user_id, session_id) -> str:
-    if session_id:
-        return session_id
-    sid = str(uuid.uuid4())
-    with conn.cursor() as cur:
-        cur.execute("INSERT INTO agent_sessions(id, agent_id, user_id) VALUES (%s,%s,%s)",
-                    (sid, agent_id, user_id))
-    conn.commit()
-    return sid
-
-def store_message(conn, session_id: str, role: str, content: str, sql_query: str = None):
-    """Store message in agent_messages table"""
-    with conn.cursor() as cur:
-        meta = {"sql_query": sql_query} if sql_query else {}
-        cur.execute("""
-            INSERT INTO agent_messages (session_id, role, content, meta)
-            VALUES (%s, %s, %s, %s)
-        """, (session_id, role, content, json.dumps(meta)))
-    conn.commit()
-
-def log_query(conn, user_id: str, question: str, sql_generated: str, error: str = None, success: bool = True, agent_id: str = None):
-    """Log query to query_logs table"""
-    with conn.cursor() as cur:
-        cur.execute("""
-            INSERT INTO query_logs (user_id, question, sql_generated, error, success, agent_id)
-            VALUES (%s, %s, %s, %s, %s, %s)
-        """, (user_id, question, sql_generated, error, success, agent_id))
-    conn.commit()
-
 def _mask_url(url: str) -> str:
     # mask the password portion between ":" and "@" once
     if ":" in url and "@" in url:
@@ -410,15 +492,23 @@ def _mask_url(url: str) -> str:
     return url
 
 def apply_system_prompts(v, conn, agent_id: str):
-    """Load active system prompts from DB into Vanna instance."""
-    with conn.cursor() as cur:
-        cur.execute("SELECT content FROM system_prompts WHERE agent_id=%s AND is_active=TRUE", (agent_id,))
-        rows = cur.fetchall()
-    for (content,) in rows:
-        try:
-            v.train(question="SYSTEM_PROMPT", sql=None, ddl=None, documentation=content)
-        except Exception as e:
-            print(f"Failed to apply system prompt: {e}")
+    """Apply system prompts from filters table"""
+    cur = conn.cursor(dictionary=True)
+    cur.execute("""
+        SELECT nlq 
+        FROM filters 
+        WHERE agent_id=%s AND is_active=1 AND nlq IS NOT NULL
+    """, (agent_id,))
+    rows = cur.fetchall()
+    cur.close()
+    
+    for row in rows:
+        content = row['nlq']
+        if content and content.strip():
+            try:
+                v.train(question="SYSTEM_PROMPT", sql=None, ddl=None, documentation=content)
+            except Exception as e:
+                print(f"Failed to apply system prompt: {e}")
 
 # ---------- request models ----------
 class AskBody(BaseModel):
@@ -436,6 +526,7 @@ class FeedbackBody(BaseModel):
     agent_id: str
     user_id: Optional[str] = None
     answer: Optional[str] = None
+    corrected_sql: Optional[str] = None
 
 class ExecuteBody(BaseModel):
     agent_id: str
@@ -460,6 +551,12 @@ class CreateAgentBody(BaseModel):
     password: Optional[str] = None
     port: Optional[int] = None
     dbType: Optional[str] = None  # "sqlserver" | "mysql" | "postgres"
+class SavePromptBody(BaseModel):
+    agent_id: str
+    user_id: str
+    question: str
+    sql_query: str
+    answer: Optional[str] = None
 
 # ---------- Vanna/OpenAI helpers ----------
 _VN_SINGLETON = None
@@ -486,11 +583,13 @@ def get_vanna():
             "engine": os.getenv("AZURE_OPENAI_DEPLOYMENT", os.getenv("OPENAI_ENGINE", "")),
             "api_key": api_key,
             "model": os.getenv("OPENAI_MODEL", "gpt-4o-mini"),
+            "allow_llm_to_see_data" : True,
         }
     else:
         cfg = {
             "api_key": api_key,
             "model": os.getenv("OPENAI_MODEL", "gpt-4o-mini"),
+            "allow_llm_to_see_data" : True,
         }
 
     try:
@@ -505,17 +604,20 @@ def get_vanna():
 def train_start(body: TrainStartBody, background_tasks: BackgroundTasks):
     run_id = str(uuid.uuid4())
     try:
-        with appdb() as conn, conn.cursor() as cur:
-            # Check if agent exists
+        with appdb() as conn:
             agent = get_agent(conn, body.agent_id)
             if not agent:
                 return {"error": "Agent not found", "run_id": None, "status": "failed"}
-                
-            cur.execute(
-                "INSERT INTO training_runs (id,agent_id,status,progress,message) VALUES (%s,%s,'queued',0,'Queued')",
-                (run_id, body.agent_id),
-            )
+            
+            cur = conn.cursor()
+            cur.execute("""
+                INSERT INTO training_runs (training_runs_id, agent_id, status, progress, message, 
+                                          create_date, started_at)
+                VALUES (%s, %s, 'queued', 0, 'Queued', NOW(), NOW())
+            """, (run_id, body.agent_id))
             conn.commit()
+            cur.close()
+            
         background_tasks.add_task(_train_job, run_id, body.agent_id)
         return {"run_id": run_id, "status": "queued", "progress": 0}
     except Exception as e:
@@ -524,12 +626,18 @@ def train_start(body: TrainStartBody, background_tasks: BackgroundTasks):
 
 def _train_job(run_id: str, agent_id: str):
     def upd(conn, prog, status, msg):
-        with conn.cursor() as c:
-            c.execute("UPDATE training_runs SET progress=%s,status=%s,message=%s WHERE id=%s",
-                      (prog, status, msg, run_id))
-            c.execute("INSERT INTO training_logs(run_id,progress,message) VALUES (%s,%s,%s)",
-                      (run_id, prog, msg))
+        cur = conn.cursor()
+        cur.execute("""
+            UPDATE training_runs 
+            SET progress=%s, status=%s, message=%s, update_date=NOW()
+            WHERE training_runs_id=%s
+        """, (prog, status, msg, run_id))
+        cur.execute("""
+            INSERT INTO training_logs(training_runs_id, ts, progress, message) 
+            VALUES (%s, NOW(), %s, %s)
+        """, (run_id, prog, msg))
         conn.commit()
+        cur.close()
 
     try:
         with appdb() as conn:
@@ -539,10 +647,11 @@ def _train_job(run_id: str, agent_id: str):
                 upd(conn, 100, "failed", "Agent not found")
                 return
             db_url = agent["db_url"]
+            db_type = agent.get("dbtype", "postgresql")
             
-            upd(conn, 15, "running", "Reading database schema")
+            upd(conn, 15, "running", f"Reading database schema ({db_type})")
             try:
-                schema_text = info_schema_text(db_url)
+                schema_text = info_schema_text(db_url, db_type)
                 if not schema_text.strip():
                     upd(conn, 100, "failed", "No schema found in database")
                     return
@@ -550,51 +659,79 @@ def _train_job(run_id: str, agent_id: str):
                 upd(conn, 100, "failed", f"Failed to read schema: {str(e)}")
                 return
 
-            upd(conn, 35, "running", "Initializing AI training (Vanna/OpenAI + ChromaDB)")
+            upd(conn, 35, "running", "Initializing AI training")
             v = get_vanna()
             if not v:
-                upd(conn, 100, "failed", "Vanna not available - check OpenAI API key")
+                upd(conn, 100, "failed", "Vanna not available")
                 return
             
             set_vanna_collection(v, agent_id)
 
             # Apply system prompts (if any)
             with appdb() as conn2:
-                apply_system_prompts(v, conn2, agent_id)    
-
+                apply_system_prompts(v, conn2, agent_id)
             
             upd(conn, 45, "running", "Connecting Vanna to database")
             try:
                 vanna_conn_str = get_vanna_connection_string(db_url)
                 v.connect_to_database(vanna_conn_str)
             except Exception as e:
-                upd(conn, 100, "failed", f"Failed to connect Vanna to database: {e}")
+                upd(conn, 100, "failed", f"Failed to connect: {e}")
                 return
             
             upd(conn, 55, "running", "Training on database schema")
             try:
-                v.train(ddl=schema_text)
+                default_schema = get_default_schema(db_type)    
+                if (db_type or "").lower() == "mysql":
+                    current_db = get_current_database_name(db_url) or "CURRENT_DB"
+                    schema_prompt = (
+                        "For MySQL, do NOT prefix tables with a schema; use bare table names. "
+                        f"If qualification is absolutely required, qualify with `{current_db}`."
+                    )
+                else:
+                    schema_prompt = f"Always use schema '{default_schema}' unless another schema is explicitly specified."
+                v.train(ddl=schema_text + "\n\n" + schema_prompt)
             except Exception as e:
-                upd(conn, 100, "failed", f"Failed to train on schema: {e}")
+                upd(conn, 100, "failed", f"Failed to train: {e}")
                 return
 
             upd(conn, 75, "running", "Loading validated Q&A pairs")
-            with conn.cursor() as cq:
-                cq.execute("SELECT question, sql_query FROM qna_chunks WHERE agent_id=%s ORDER BY qna_chunks_id", (agent_id,))
-                pairs = cq.fetchall()
+            cur = conn.cursor(dictionary=True)
+            cur.execute("""
+                SELECT favorite_name as question, favorite_query as sql_query 
+                FROM favorite_queries 
+                WHERE agent_id=%s AND is_active=1
+                ORDER BY favorite_query_id
+            """, (agent_id,))
+            pairs = cur.fetchall()
+            cur.close()
                 
             total = max(1, len(pairs))
-            for i,(q,s) in enumerate(pairs, start=1):
+            for i, pair in enumerate(pairs, start=1):
                 try:
-                    v.train(question=q, sql=s)
+                    v.train(question=pair['question'], sql=pair['sql_query'])
                     upd(conn, 75 + int(20*i/total), "running", f"Training Q&A {i}/{len(pairs)}")
                 except Exception as e:
                     print(f"Error training Q&A pair {i}: {e}")
 
-            with conn.cursor() as cu:
-                cu.execute("UPDATE ai_agents SET trained_at=NOW() WHERE id=%s", (agent_id,))
-                conn.commit()
-            upd(conn, 100, "succeeded", "Training complete. You can start asking questions.")
+            cur = conn.cursor()
+            cur.execute("""
+                UPDATE agent SET update_date=NOW(), update_by=1 
+                WHERE agent_id=%s
+            """, (agent_id,))
+            conn.commit()
+            cur.close()
+            
+            cur = conn.cursor()
+            cur.execute("""
+                UPDATE training_runs 
+                SET finished_at=NOW() 
+                WHERE training_runs_id=%s
+            """, (run_id,))
+            conn.commit()
+            cur.close()
+            
+            upd(conn, 100, "succeeded", "Training complete")
             
     except Exception as e:
         print(f"Training job error: {e}")
@@ -604,12 +741,27 @@ def _train_job(run_id: str, agent_id: str):
 @app.get("/train/status/{run_id}")
 def train_status(run_id: str):
     try:
-        with appdb() as conn, conn.cursor() as cur:
-            cur.execute("SELECT agent_id,status,progress,message,started_at,finished_at FROM training_runs WHERE id=%s", (run_id,))
+        with appdb() as conn:
+            cur = conn.cursor(dictionary=True)
+            cur.execute("""
+                SELECT agent_id, status, progress, message, started_at, finished_at 
+                FROM training_runs 
+                WHERE training_runs_id=%s
+            """, (run_id,))
             r = cur.fetchone()
-            if not r: return {"error": "not_found"}
-            return {"run_id": run_id, "agent_id": r[0], "status": r[1], "progress": r[2],
-                    "message": r[3], "started_at": r[4], "finished_at": r[5]}
+            cur.close()
+            
+            if not r:
+                return {"error": "not_found"}
+            return {
+                "run_id": run_id,
+                "agent_id": r['agent_id'],
+                "status": r['status'],
+                "progress": r['progress'],
+                "message": r['message'],
+                "started_at": r['started_at'],
+                "finished_at": r['finished_at']
+            }
     except Exception as e:
         return {"error": str(e)}
 
@@ -617,42 +769,70 @@ def train_status(run_id: str):
 @app.post("/ask")
 def ask(body: AskBody):
     t0 = time.time()
+    session_id = body.session_id or str(uuid.uuid4())
+    
     try:
         with appdb() as conn:
             agent = get_agent(conn, body.agent_id)
             if not agent:
-                return {"answer":"Agent not found","sql":"","data":{"columns":[],"rows":[]}}
+                return {"answer":"Agent not found","sql":"","data":{"columns":[],"rows":[]},"session_id":session_id}
             db_url = agent["db_url"]
-            
-            session_id = ensure_session(conn, body.agent_id, body.user_id, body.session_id)
-            store_message(conn, session_id, "user", body.question)
+            db_type = agent.get("dbtype", "postgresql")
 
-        # Set up Vanna with proper database connection
         v = get_vanna()
         if not v:
-            error_msg = "Vanna is not available (OpenAI/Chroma import or config error)"
-            with appdb() as conn:
-                log_exec(conn, body.agent_id, body.user_id, body.question, "", False, error_msg, 0, int((time.time()-t0)*1000))
-                log_query(conn, body.user_id or "anonymous", body.question, "", error_msg, False, body.agent_id)
+            error_msg = "Vanna not available"
             return {"answer": f"Failed: {error_msg}", "sql":"", "data":{"columns":[],"rows":[]}, "session_id": session_id}
 
         set_vanna_collection(v, body.agent_id)
 
-        with appdb() as conn2:
-            cur = conn2.cursor()
-            cur.execute("SELECT content FROM system_prompts WHERE agent_id=%s AND is_active=TRUE", (body.agent_id,))
-            for (content,) in cur.fetchall():
-                v.set_system_prompt(content)
+        # Apply schema-specific system prompt
+        default_schema = get_default_schema(db_type)
+        
+        dtype = (db_type or "").lower()
+        if dtype == "mysql":
+            current_db = get_current_database_name(db_url) or "CURRENT_DB"
+            schema_instruction = (
+                "For MySQL, do NOT prefix tables with a schema; use bare table names. "
+                f"If qualification is required, qualify with `{current_db}`.\n"
+                "If asked for the current database name, use: SELECT DATABASE();"
+            )
+        elif dtype in ("sqlserver", "mssql"):
+            schema_instruction = (
+                f"For SQL Server, use schema '{default_schema or 'dbo'}' unless specified. "
+                "If asked for the current database name, use: SELECT DB_NAME();"
+            )
+        elif dtype in ("postgres", "postgresql"):
+            schema_instruction = (
+                f"For PostgreSQL, use schema '{default_schema or 'public'}' unless specified. "
+                "If asked for the current database name, use: SELECT current_database();"
+            )
+        else:
+            schema_instruction = (
+                f"Use schema '{default_schema or 'public'}' unless specified."
+            )
 
-        # Connect to target database
+        all_prompts = [schema_instruction]
+        with appdb() as conn2:
+            cur = conn2.cursor(dictionary=True)
+            cur.execute("""
+                SELECT nlq 
+                FROM filters 
+                WHERE agent_id=%s AND is_active=1 AND nlq IS NOT NULL
+            """, (body.agent_id,))
+            for row in cur.fetchall():
+                content = row['nlq']
+                if content and content.strip():
+                    all_prompts.append(content.strip())
+            cur.close()
+
+        v.set_system_prompt("\n\n".join(all_prompts))
+
         try:
             vanna_conn_str = get_vanna_connection_string(db_url)
             v.connect_to_database(vanna_conn_str)
         except Exception as e:
-            error_msg = f"Failed to connect to database: {e}"
-            with appdb() as conn:
-                log_exec(conn, body.agent_id, body.user_id, body.question, "", False, error_msg, 0, int((time.time()-t0)*1000))
-                log_query(conn, body.user_id or "anonymous", body.question, "", error_msg, False, body.agent_id)
+            error_msg = f"Failed to connect: {e}"
             return {"answer": error_msg, "sql":"", "data":{"columns":[],"rows":[]}, "session_id": session_id}
 
         # Generate SQL
@@ -661,9 +841,6 @@ def ask(body: AskBody):
             sql = v.generate_sql(body.question)
         except Exception as e:
             error_msg = f"SQL generation failed: {str(e)}"
-            with appdb() as conn:
-                log_exec(conn, body.agent_id, body.user_id, body.question, "", False, error_msg, 0, int((time.time()-t0)*1000))
-                log_query(conn, body.user_id or "anonymous", body.question, "", error_msg, False, body.agent_id)
             return {"answer": error_msg, "sql":"", "data":{"columns":[],"rows":[]}, "session_id": session_id}
 
         columns, rows, err = [], [], None
@@ -675,91 +852,265 @@ def ask(body: AskBody):
 
         dur_ms = int((time.time()-t0)*1000)
         answer = "Query executed successfully." if not err else f"Execution error: {err}"
-        
-        with appdb() as conn:
-            log_exec(conn, body.agent_id, body.user_id, body.question, sql, err is None, err, len(rows or []), dur_ms)
-            log_query(conn, body.user_id or "anonymous", body.question, sql, err, err is None, body.agent_id)
-            store_message(conn, session_id, "assistant", answer, sql)
 
         return {"answer": answer, "sql": sql, "data": {"columns": columns, "rows": rows}, "session_id": session_id}
         
     except Exception as e:
         print(f"Error in ask endpoint: {e}")
-        return {"answer": f"Internal error: {str(e)}", "sql": "", "data": {"columns": [], "rows": []}}
+        return {"answer": f"Internal error: {str(e)}", "sql": "", "data": {"columns": [], "rows": []}, "session_id": session_id}
 
-# ---------- EXECUTE edited SQL (no LLM) ----------
+# ---------- EXECUTE (manual run) ----------
 @app.post("/execute")
-def execute_sql(body: ExecuteBody):
-    t0 = time.time()
+def execute_query(body: ExecuteBody):
+    """
+    Execute raw SQL against the agent's configured target DB with a preview limit.
+    Returns columns and rows on success, or an error string on failure.
+    """
     try:
-        # Locate agent and target DB URL
+        # Resolve agent -> connection string
         with appdb() as conn:
             agent = get_agent(conn, body.agent_id)
             if not agent:
-                return {"success": False, "error": "Agent not found", "columns": [], "rows": [], "sql": body.sql}
+                return {"success": False, "error": "Agent not found"}
             db_url = agent["db_url"]
 
-        # Execute SQL preview safely with limit/top enforcement
-        try:
-            columns, rows = run_sql_preview(db_url, body.sql, body.limit)
-            success = True
-            err = None
-        except Exception as ex:
-            columns, rows = [], []
-            success = False
-            err = str(ex)
-
-        dur_ms = int((time.time() - t0) * 1000)
-
-        # Best-effort logging (non-fatal)
-        try:
-            with appdb() as conn:
-                log_exec(conn, body.agent_id, body.user_id, "[Manual SQL]", body.sql, success, err, len(rows or []), dur_ms)
-        except Exception:
-            pass
-
+        # Run with preview/limit handling per RDBMS
+        limit = body.limit or 50
+        cols, data = run_sql_preview(db_url, body.sql, limit)
         return {
-            "success": success,
-            "error": err,
-            "columns": columns,
-            "rows": rows,
+            "success": True,
+            "columns": cols,
+            "rows": data,
             "sql": body.sql
         }
-
     except Exception as e:
-        return {"success": False, "error": str(e), "columns": [], "rows": [], "sql": body.sql}
- 
-# ---------- FEEDBACK ----------
+        return {
+            "success": False,
+            "error": str(e)
+        }
+# ---------- EXECUTE (manual run) ----------
+@app.post("/execute")
+def execute_query(body: ExecuteBody):
+    """
+    Execute raw SQL against the agent's configured target DB with a preview limit.
+    Returns columns and rows on success, or an error string on failure.
+    """
+    try:
+        # Resolve agent -> connection string
+        with appdb() as conn:
+            agent = get_agent(conn, body.agent_id)
+            if not agent:
+                return {"success": False, "error": "Agent not found"}
+            db_url = agent["db_url"]
+
+        # Run with preview/limit handling per RDBMS
+        limit = body.limit or 50
+        cols, data = run_sql_preview(db_url, body.sql, limit)
+        return {
+            "success": True,
+            "columns": cols,
+            "rows": data,
+            "sql": body.sql
+        }
+    except Exception as e:
+        return {
+            "success": False,
+            "error": str(e)
+        }
+# ---------- FEEDBACK with corrected SQL support ----------
 @app.post("/feedback")
 def feedback(body: FeedbackBody):
     try:
-        with appdb() as conn, conn.cursor() as cur:
-            cur.execute("""
-              INSERT INTO training_data (question, sql_query, answer, feedback, agent_id, user_id)
-              VALUES (%s,%s,%s,%s,%s,%s)
-            """, (body.question, body.sql, body.answer, body.valid, body.agent_id, body.user_id))
+        with appdb() as conn:
+            final_sql = body.corrected_sql if body.corrected_sql else body.sql
+            
+            cur = conn.cursor()
+            # Store in favorite_queries if valid
             if body.valid:
                 cur.execute("""
-                  INSERT INTO qna_chunks (question, sql_query, answer_preview, embedding, agent_id, user_id)
-                  VALUES (%s,%s,%s,%s,%s,%s)
-                """, (body.question, body.sql, body.answer or "", None, body.agent_id, body.user_id))
+                    INSERT INTO favorite_queries (agent_id, favorite_name, favorite_query, 
+                                                 description, created_by)
+                    VALUES (%s, %s, %s, %s, %s)
+                """, (body.agent_id, body.question[:150], final_sql, 
+                      body.answer or "Validated query", body.user_id or 1))
             conn.commit()
-        return {"success": True}
+            cur.close()
+            
+        return {"success": True, "message": "Feedback saved successfully"}
     except Exception as e:
         print(f"Error in feedback endpoint: {e}")
         return {"success": False, "error": str(e)}
 
-# ----------Create Agents ----------
+# ---------- Save prompt endpoint ----------
+@app.post("/prompts/save")
+def save_prompt(body: SavePromptBody):
+    """Save a prompt to favorite_queries for future reference"""
+    try:
+        with appdb() as conn:
+            cur = conn.cursor()
+            cur.execute("""
+                INSERT INTO favorite_queries (agent_id, favorite_name, favorite_query, 
+                                             description, created_by, created_at)
+                VALUES (%s, %s, %s, %s, %s, NOW())
+            """, (body.agent_id, body.question[:150], body.sql_query, 
+                  body.answer or "Saved prompt", body.user_id or 1))
+            conn.commit()
+            prompt_id = cur.lastrowid
+            cur.close()
+            
+        return {"success": True, "prompt_id": prompt_id, "message": "Prompt saved successfully"}
+    except Exception as e:
+        print(f"Error saving prompt: {e}")
+        return {"success": False, "error": str(e)}
+
+# ---------- Get saved prompts ----------
+@app.get("/prompts/saved/{agent_id}")
+def get_saved_prompts(agent_id: str, user_id: str = None):
+    """Get all saved prompts for an agent"""
+    try:
+        with appdb() as conn:
+            cur = conn.cursor(dictionary=True)
+            if user_id:
+                cur.execute("""
+                    SELECT favorite_query_id as id, favorite_name as question, 
+                           favorite_query as sql_query, description as answer, 
+                           created_at
+                    FROM favorite_queries 
+                    WHERE agent_id=%s AND created_by=%s AND is_active=1
+                    ORDER BY created_at DESC
+                """, (agent_id, user_id))
+            else:
+                cur.execute("""
+                    SELECT favorite_query_id as id, favorite_name as question, 
+                           favorite_query as sql_query, description as answer, 
+                           created_at
+                    FROM favorite_queries 
+                    WHERE agent_id=%s AND is_active=1
+                    ORDER BY created_at DESC
+                """, (agent_id,))
+            rows = cur.fetchall()
+            cur.close()
+        
+        prompts = [
+            {
+                "id": r['id'],
+                "question": r['question'],
+                "sql_query": r['sql_query'],
+                "answer": r['answer'],
+                "created_at": r['created_at'].isoformat() if r['created_at'] else None
+            }
+            for r in rows
+        ]
+        return {"success": True, "prompts": prompts}
+    except Exception as e:
+        print(f"Error getting saved prompts: {e}")
+        return {"success": False, "error": str(e), "prompts": []}
+
+# ---------- Favourites: list + detail ----------
+@app.get("/favorites/{agent_id}")
+def list_favorites(agent_id: str):
+    """List saved favourite queries for an agent (id, name, created_at)."""
+    try:
+        with appdb() as conn:
+            cur = conn.cursor(dictionary=True)
+            cur.execute("""
+                SELECT
+                    favorite_query_id as id,
+                    favorite_name as name,
+                    created_at
+                FROM favorite_queries
+                WHERE agent_id=%s AND is_active=1
+                ORDER BY created_at DESC
+            """, (agent_id,))
+            rows = cur.fetchall()
+            cur.close()
+        return {"success": True, "favorites": rows}
+    except Exception as e:
+        print(f"Error list_favorites: {e}")
+        return {"success": False, "error": str(e), "favorites": []}
+
+@app.get("/favorites/detail/{favorite_id}")
+def favorite_detail(favorite_id: int):
+    """Get favourite query details by id.
+    Tries stored procedure sp_get_favorite_query_by_id(favorite_id)
+    and falls back to direct SELECT if SP is absent.
+    Returns: { id, favorite_name, favorite_query, description, created_at }
+    Also maps description (NLQ) so the UI can prefill NLQ and SQL editors.
+    """
+    try:
+        with appdb() as conn:
+            cur = conn.cursor(dictionary=True)
+            # Try stored procedure first
+            tried_proc = False
+            try:
+                tried_proc = True
+                cur.callproc("sp_get_favorite_query_by_id", [favorite_id])
+                # Some drivers require fetching from next result set
+                # Fetch first available result set rows
+                result_rows = []
+                # Try to iterate over available result sets
+                for _ in range(2):  # safe small loop
+                    rows = cur.fetchall()
+                    if rows:
+                        result_rows = rows
+                        break
+                    # Advance if supported
+                    try:
+                        cur.nextset()
+                    except Exception:
+                        break
+                if not result_rows:
+                    # If no rows from SP, fall back to select
+                    raise Exception("SP returned no rows")
+                row = result_rows[0]
+            except Exception as _:
+                # Fallback to direct select
+                cur.close()
+                cur = conn.cursor(dictionary=True)
+                cur.execute("""
+                    SELECT
+                        favorite_query_id as id,
+                        favorite_name,
+                        favorite_query,
+                        description,
+                        created_at
+                    FROM favorite_queries
+                    WHERE favorite_query_id=%s AND is_active=1
+                    LIMIT 1
+                """, (favorite_id,))
+                row = cur.fetchone() or {}
+
+            cur.close()
+
+        if not row:
+            return {"success": False, "error": "not_found"}
+
+        # Normalize keys for frontend use
+        return {
+            "success": True,
+            "favorite": {
+                "id": row.get("id") or row.get("favorite_query_id"),
+                "favorite_name": row.get("favorite_name") or row.get("name"),
+                "favorite_query": row.get("favorite_query") or row.get("sql_query"),
+                "description": row.get("description") or row.get("nlq") or "",
+                "created_at": (row.get("created_at").isoformat()
+                               if hasattr(row.get("created_at"), "isoformat") else row.get("created_at"))
+            }
+        }
+    except Exception as e:
+        print(f"Error favorite_detail: {e}")
+        return {"success": False, "error": str(e)}
+
+# ---------- Create Agents ----------
 @app.post("/agents")
 def create_agent(b: CreateAgentBody):
     try:
-        # basic validation
         if not b.user_id or not b.name:
             raise HTTPException(status_code=400, detail="user_id and name are required")
-        if len(b.name) > 255:
-            raise HTTPException(status_code=400, detail="Agent name must be less than 255 characters")
+        if len(b.name) > 100:
+            raise HTTPException(status_code=400, detail="Agent name must be less than 100 characters")
 
-        # Build db_url if not provided
+        uid = int(str(b.user_id)) if str(b.user_id).isdigit() else 1
         final_db_url = b.db_url
         final_port = b.port
         final_dbtype = (b.dbType or "").lower() if b.dbType else None
@@ -768,11 +1119,10 @@ def create_agent(b: CreateAgentBody):
             if not (final_dbtype and b.host and b.dbName and b.user is not None and b.password is not None):
                 raise HTTPException(
                     status_code=400,
-                    detail="When db_url is not provided, dbType, host, dbName, user, password (and optionally port) are required"
+                    detail="When db_url is not provided, dbType, host, dbName, user, password are required"
                 )
             final_db_url = build_db_url(final_dbtype, b.host, b.port or 5432, b.dbName, b.user, b.password)
 
-            # if port was omitted, infer what we used
             if final_port is None:
                 if final_dbtype == "sqlserver":
                     final_port = 1433
@@ -804,31 +1154,49 @@ def create_agent(b: CreateAgentBody):
         # Generate agent_id if not provided
         agent_id = b.agent_id or str(uuid4())
         
-        # Persist
-        with appdb() as conn, conn.cursor() as cur:
-            cur.execute(
-                """
-                INSERT INTO ai_agents(id, user_id, name, description, dbtype, port, db_url)
-                VALUES (%s, %s, %s, %s, %s, %s, %s)
-                """,
-                (agent_id, b.user_id, b.name, b.description, final_dbtype, final_port, final_db_url),
-            )
+        with appdb() as conn:
+            cur = conn.cursor()
+            
+            # Insert into agent table
+            cur.execute("""
+                INSERT INTO agent(agent_id, user_id, agent_name, agent_description, 
+                                 create_by, create_date)
+                VALUES (%s, %s, %s, %s, %s, NOW())
+            """, (agent_id, uid, b.name, b.description, uid))
+            
+            # Parse connection details
+            parsed = parse_db_url(final_db_url)
+            
+            # Insert into db_configs table
+            cur.execute("""
+                INSERT INTO db_configs(agent_id, db_type, db_connection_string,
+                                      db_host, db_name, db_user, db_pass, db_port,
+                                      create_by, create_date)
+                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, NOW())
+            """, (agent_id, final_dbtype, final_db_url,
+                  parsed['host'], parsed['db'], parsed['user'],
+                  parsed['password'], final_port, uid))
+            
             conn.commit()
 
-            # 🚀 Add default SQL Server system prompt
+            # Add default schema-specific system prompt as filter
+            default_schema = get_default_schema(final_dbtype)
             if final_dbtype == "sqlserver":
-                cur.execute(
-                    """
-                    INSERT INTO system_prompts(agent_id, content, is_active)
-                    VALUES (%s, %s, TRUE)
-                    """,
-                    (
-                        agent_id,
-                        "This agent is connected to a SQL Server database. "
-                        "Use the schema 'dbo' unless another schema is explicitly specified."
-                    )
-                )
-                conn.commit()
+                prompt_content = f"This agent is connected to a SQL Server database. Always use the schema '{default_schema}' unless another schema is explicitly specified in the question."
+            elif final_dbtype == "mysql":
+                prompt_content = f"This agent is connected to a MySQL database. Use the database name as schema context."
+            else:  # PostgreSQL
+                prompt_content = f"This agent is connected to a PostgreSQL database. Always use the schema '{default_schema}' unless another schema is explicitly specified."
+            
+            cur.execute("""
+                INSERT INTO filters(agent_id, filter_name, nlq, filter_description,
+                                   create_by, create_date)
+                VALUES (%s, %s, %s, %s, %s, NOW())
+            """, (agent_id, "Default Schema Prompt", prompt_content,
+                  "Auto-generated schema guidance", uid))
+            
+            conn.commit()
+            cur.close()
 
         return {
             "success": True,
@@ -854,12 +1222,26 @@ class SetPromptBody(BaseModel):
 @app.post("/prompts")
 def set_prompt(b: SetPromptBody):
     try:
-        with appdb() as conn, conn.cursor() as cur:
+        with appdb() as conn:
+            cur = conn.cursor()
+            
             if b.deactivate_others:
-                cur.execute("UPDATE system_prompts SET is_active=FALSE WHERE agent_id=%s", (b.agent_id,))
-            cur.execute("INSERT INTO system_prompts(agent_id, content, is_active) VALUES (%s,%s,TRUE)",
-                        (b.agent_id, b.content))
+                cur.execute("""
+                    UPDATE filters 
+                    SET is_active=0, update_by=1, update_date=NOW() 
+                    WHERE agent_id=%s
+                """, (b.agent_id,))
+            
+            cur.execute("""
+                INSERT INTO filters(agent_id, filter_name, nlq, filter_description,
+                                   create_by, create_date)
+                VALUES (%s, %s, %s, %s, %s, NOW())
+            """, (b.agent_id, "Custom System Prompt", b.content, 
+                  "User-defined system prompt", 1))
+            
             conn.commit()
+            cur.close()
+            
         return {"success": True}
     except Exception as e:
         print(f"Error setting prompt: {e}")
@@ -872,15 +1254,37 @@ class AddQnABody(BaseModel):
     sql_query: str
     answer_preview: Optional[str] = None
     user_id: Optional[str] = None
+    favorite_name: Optional[str] = None
 
 @app.post("/qna")
 def add_qna(b: AddQnABody):
+    """Add to favourites via stored procedure sp_add_favorite_query.
+    - p_agent_id: UUID string (DB side updated to accept string UUID)
+    - p_favorite_name: favourite name (prompted in UI) or fallback to NLQ (150 chars)
+    - p_favorite_query: generated SQL
+    - p_description: NLQ (as requested)
+    - p_created_by: numeric user id (fallback 1)
+    - p_created_purpose: NULL
+    """
     try:
-        with appdb() as conn, conn.cursor() as cur:
-            cur.execute("""INSERT INTO qna_chunks(agent_id,user_id,question,sql_query,answer_preview,embedding)
-                           VALUES (%s,%s,%s,%s,%s,NULL)""",
-                           (b.agent_id, b.user_id, b.question, b.sql_query, b.answer_preview or ""))
+        with appdb() as conn:
+            cur = conn.cursor()
+            fav_name = (b.favorite_name or b.question or "")[:150]
+            desc = b.question or ""
+            created_by = 1
+            try:
+                if b.user_id is not None and str(b.user_id).isdigit():
+                    created_by = int(str(b.user_id))
+            except Exception:
+                created_by = 1
+
+            # CALL sp_add_favorite_query(agent_id, favorite_name, favorite_query, description, created_by, created_purpose=NULL)
+            cur.callproc(
+                "sp_add_favorite_query",
+                [b.agent_id, fav_name, b.sql_query, desc, created_by, None]
+            )
             conn.commit()
+            cur.close()
         return {"success": True}
     except Exception as e:
         print(f"Error adding QnA: {e}")
@@ -889,49 +1293,43 @@ def add_qna(b: AddQnABody):
 # ---------- History ----------
 @app.get("/history/{agent_id}")
 def history(agent_id: str, limit: int = 50):
+    """Get conversation history - using favorite_queries as history log"""
     try:
-        with appdb() as conn, conn.cursor() as cur:
-            cur.execute("""SELECT m.created_at, s.id, m.role, m.content, m.meta, m.id
-                           FROM agent_messages m
-                           JOIN agent_sessions s ON s.id=m.session_id
-                           WHERE s.agent_id=%s
-                           ORDER BY m.created_at ASC LIMIT %s""",
-                           (agent_id, limit))
+        with appdb() as conn:
+            cur = conn.cursor(dictionary=True)
+            cur.execute("""
+                SELECT favorite_query_id, favorite_name, favorite_query, 
+                       description, created_at, created_by
+                FROM favorite_queries
+                WHERE agent_id=%s AND is_active=1
+                ORDER BY created_at DESC
+                LIMIT %s
+            """, (agent_id, limit))
             rows = cur.fetchall()
+            cur.close()
         
-        # Group messages by session
+        # Format as conversations
         conversations = []
-        current_conversation = None
-        
         for r in rows:
-            meta = json.loads(r[4]) if r[4] else {}
-            sql_query = meta.get("sql_query")
-            
-            if r[2] == "user":  # New conversation starts with user message
-                if current_conversation and len(current_conversation["messages"]) > 1:
-                    conversations.append(current_conversation)
-                current_conversation = {
-                    "session_id": r[1],
-                    "messages": [{
-                        "id": r[5],
-                        "ts": r[0].isoformat(), 
-                        "role": r[2], 
-                        "content": r[3],
-                        "sql_query": sql_query
-                    }]
-                }
-            elif current_conversation and r[2] == "assistant":
-                current_conversation["messages"].append({
-                    "id": r[5],
-                    "ts": r[0].isoformat(), 
-                    "role": r[2], 
-                    "content": r[3],
-                    "sql_query": sql_query
-                })
-        
-        # Add the last conversation if it exists
-        if current_conversation and len(current_conversation["messages"]) > 1:
-            conversations.append(current_conversation)
+            conversations.append({
+                "session_id": str(r['favorite_query_id']),
+                "messages": [
+                    {
+                        "id": str(r['favorite_query_id']) + "_q",
+                        "ts": r['created_at'].isoformat() if r['created_at'] else None,
+                        "role": "user",
+                        "content": r['favorite_name'],
+                        "sql_query": None
+                    },
+                    {
+                        "id": str(r['favorite_query_id']) + "_a",
+                        "ts": r['created_at'].isoformat() if r['created_at'] else None,
+                        "role": "assistant",
+                        "content": r['description'] or "Query executed",
+                        "sql_query": r['favorite_query']
+                    }
+                ]
+            })
         
         return {"conversations": conversations}
     except Exception as e:
@@ -942,17 +1340,144 @@ def history(agent_id: str, limit: int = 50):
 @app.get("/agents/{user_id}")
 def get_agents(user_id: str):
     try:
-        with appdb() as conn, conn.cursor() as cur:
-            cur.execute("""SELECT id, name, description, db_url, created_at, trained_at 
-                           FROM ai_agents WHERE user_id=%s ORDER BY created_at DESC""", (user_id,))
+        uid = int(str(user_id)) if str(user_id).isdigit() else 1
+        if uid is None:
+            return []
+        with appdb() as conn:
+            cur = conn.cursor(dictionary=True)
+            cur.execute("""
+                SELECT a.agent_id as id, a.agent_name as name, 
+                       a.agent_description as description,
+                       a.create_date as created_at, a.update_date as trained_at,
+                       dc.db_connection_string as db_url, dc.db_type as dbtype
+                FROM agent a
+                LEFT JOIN db_configs dc ON a.agent_id = dc.agent_id AND dc.is_active=1
+                WHERE a.user_id=%s AND a.is_active=1
+                ORDER BY a.create_date DESC
+            """, (uid,))
             rows = cur.fetchall()
-        return [{"id": r[0], "name": r[1], "description": r[2], "db_url": r[3], 
-                 "created_at": r[4], "trained_at": r[5]} for r in rows]
+            cur.close()
+            
+        return [
+            {
+                "id": r['id'],
+                "name": r['name'],
+                "description": r['description'],
+                "db_url": r['db_url'],
+                "created_at": r['created_at'],
+                "trained_at": r['trained_at'],
+                "dbtype": r['dbtype']
+            }
+            for r in rows
+        ]
     except Exception as e:
         print(f"Error getting agents: {e}")
         return []
 
-# Fast health check for Node.js service monitoring
+# ---------- Get Agent Details ----------
+@app.get("/agents/detail/{agent_id}")
+def get_agent_detail(agent_id: str):
+    try:
+        with appdb() as conn:
+            agent = get_agent(conn, agent_id)
+            if not agent:
+                return {"error": "Agent not found"}
+            
+            # Get widget count for this agent
+            cur = conn.cursor()
+            cur.execute("""
+                SELECT COUNT(*) as widget_count
+                FROM dashboard_widgets dw
+                INNER JOIN dashboards d ON dw.dashboard_id = d.dashboard_id
+                WHERE d.user_id IN (SELECT user_id FROM agent WHERE agent_id=%s)
+                  AND dw.is_active=1
+            """, (agent_id,))
+            widget_count = cur.fetchone()[0]
+            cur.close()
+            
+            agent['widget_count'] = widget_count
+            return agent
+    except Exception as e:
+        print(f"Error getting agent detail: {e}")
+        return {"error": str(e)}
+
+# ---------- Dashboards ----------
+class CreateDashboardBody(BaseModel):
+    user_id: str
+    dashboard_name: str
+    dashboard_description: Optional[str] = None
+    is_public: bool = False
+
+@app.post("/dashboards")
+def create_dashboard(b: CreateDashboardBody):
+    try:
+        with appdb() as conn:
+            cur = conn.cursor()
+            cur.execute("""
+                INSERT INTO dashboards(user_id, dashboard_name, dashboard_description, 
+                                      is_public, create_by, create_date)
+                VALUES (%s, %s, %s, %s, %s, NOW())
+            """, (b.user_id, b.dashboard_name, b.dashboard_description, 
+                  b.is_public, b.user_id))
+            conn.commit()
+            dashboard_id = cur.lastrowid
+            cur.close()
+            
+        return {"success": True, "dashboard_id": dashboard_id}
+    except Exception as e:
+        print(f"Error creating dashboard: {e}")
+        return {"success": False, "error": str(e)}
+
+@app.get("/dashboards/{user_id}")
+def get_dashboards(user_id: str):
+    try:
+        uid = int(str(user_id)) if str(user_id).isdigit() else 1
+        if uid is None:
+            return {"dashboards": []}
+        with appdb() as conn:
+            cur = conn.cursor(dictionary=True)
+            cur.execute("""
+                SELECT dashboard_id, dashboard_name, dashboard_description, 
+                       is_public, layout_config, create_date
+                FROM dashboards
+                WHERE user_id=%s AND is_active=1
+                ORDER BY create_date DESC
+            """, (uid,))
+            rows = cur.fetchall()
+            cur.close()
+            
+        return {"dashboards": rows}
+    except Exception as e:
+        print(f"Error getting dashboards: {e}")
+        return {"dashboards": []}
+
+# ---------- Widgets ----------
+class CreateWidgetBody(BaseModel):
+    widget_name: str
+    widget_type: str
+    sql_query: str
+    user_id: str
+
+@app.post("/widgets")
+def create_widget(b: CreateWidgetBody):
+    try:
+        with appdb() as conn:
+            cur = conn.cursor()
+            cur.execute("""
+                INSERT INTO widgets(widget_name, widget_type, sql_query, 
+                                   create_by, create_date)
+                VALUES (%s, %s, %s, %s, NOW())
+            """, (b.widget_name, b.widget_type, b.sql_query, b.user_id))
+            conn.commit()
+            widget_id = cur.lastrowid
+            cur.close()
+            
+        return {"success": True, "widget_id": widget_id}
+    except Exception as e:
+        print(f"Error creating widget: {e}")
+        return {"success": False, "error": str(e)}
+
+# Health endpoints
 @app.get("/health")
 def health_check():
     """Lightweight health check that responds quickly"""
@@ -973,8 +1498,9 @@ def detailed_health_check():
         
         try:
             with appdb() as conn:
-                with conn.cursor() as cur:
-                    cur.execute("SELECT 1")
+                cur = conn.cursor()
+                cur.execute("SELECT 1")
+                cur.close()
             db_status = "connected"
         except Exception as e:
             db_status = "disconnected"
@@ -1028,8 +1554,9 @@ def check_database():
     """Check database connection only"""
     try:
         with appdb() as conn:
-            with conn.cursor() as cur:
-                cur.execute("SELECT 1")
+            cur = conn.cursor()
+            cur.execute("SELECT 1")
+            cur.close()
         return {"database": "connected", "timestamp": datetime.utcnow().isoformat()}
     except Exception as e:
         return {"database": "disconnected", "error": str(e), "timestamp": datetime.utcnow().isoformat()}
@@ -1050,7 +1577,7 @@ def check_vanna():
 def test_sqlserver_drivers():
     """Test available SQL Server drivers and configurations"""
     try:
-        drivers = pyodbc.drivers()
+        drivers = pyodbc_driver.drivers() if pyodbc_driver else []
         available_drivers = [d for d in drivers if "SQL Server" in d]
         
         return {

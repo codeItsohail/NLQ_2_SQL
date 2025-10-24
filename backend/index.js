@@ -20,6 +20,7 @@ const pool = new Pool({
 
 
 const PYTHON_AI_URL = process.env.PYTHON_AI_URL || "http://127.0.0.1:8000";
+const DEFAULT_USER_ID = process.env.DEFAULT_USER_ID || '1';
 
 // Health check for Python service with improved timeout and retry logic
 // Health check for Python service with improved timeout and retry logic
@@ -147,7 +148,8 @@ const handlePythonServiceRequest = async (req, res, url, body = null, method = '
     }
     
     const duration = Date.now() - startTime;
-    console.log(`Request completed in ${duration}ms`);
+    const size = typeof response.data === 'string' ? response.data.length : JSON.stringify(response.data).length;
+    console.log(`Request completed in ${duration}ms, status=${response.status}, bytes=${size}`);
     
     // Handle different response statuses
     if (response.status >= 400) {
@@ -417,27 +419,19 @@ app.post("/api/agents", async (req, res) => {
 });
 
 */
-// Get Agents for a User
-app.get("/api/agents/:user_id", async (req, res) => {
-  try {
-    const { user_id } = req.params;
-    
-    if (!user_id) {
-      return res.status(400).json({ success: false, error: "user_id is required" });
-    }
+// List Agents (supports optional ?user_id=...; falls back to DEFAULT_USER_ID)
+app.get("/api/agents", requirePythonService, async (req, res) => {
+  const raw = (req.query.user_id ?? DEFAULT_USER_ID) + '';
+  const uid = /^[0-9]+$/.test(raw) ? raw : DEFAULT_USER_ID;
+  await handlePythonServiceRequest(req, res, `${PYTHON_AI_URL}/agents/${uid}`);
+});
 
-    const { rows } = await pool.query(
-      `SELECT id, name, description, db_url, created_at, trained_at 
-       FROM ai_agents 
-       WHERE user_id=$1 
-       ORDER BY created_at DESC`,
-      [user_id]
-    );
-    res.json(rows);
-  } catch (err) {
-    console.error("Error /api/agents/:user_id:", err.message);
-    res.status(500).json({ success: false, error: err.message });
-  }
+// Get Agents for a User
+app.get("/api/agents/:user_id", requirePythonService, async (req, res) => {
+  // Coerce non-numeric user IDs to 1 to match AI service app DB expectations
+  const raw = req.params.user_id || '';
+  const uid = /^[0-9]+$/.test(String(raw)) ? String(raw) : '1';
+  await handlePythonServiceRequest(req, res, `${PYTHON_AI_URL}/agents/${uid}`);
 });
 
 // Delete Agent
@@ -486,6 +480,18 @@ app.get("/api/history/:agent_id", requirePythonService, async (req, res) => {
   const { agent_id } = req.params;
   const { limit = 50 } = req.query;
   await handlePythonServiceRequest(req, res, `${PYTHON_AI_URL}/history/${agent_id}?limit=${limit}`);
+});
+
+// Favourites: list by agent
+app.get("/api/favorites/:agent_id", requirePythonService, async (req, res) => {
+  const { agent_id } = req.params;
+  await handlePythonServiceRequest(req, res, `${PYTHON_AI_URL}/favorites/${agent_id}`);
+});
+
+// Favourites: detail by favorite_id
+app.get("/api/favorites/detail/:favorite_id", requirePythonService, async (req, res) => {
+  const { favorite_id } = req.params;
+  await handlePythonServiceRequest(req, res, `${PYTHON_AI_URL}/favorites/detail/${favorite_id}`);
 });
 
 // System prompts endpoints

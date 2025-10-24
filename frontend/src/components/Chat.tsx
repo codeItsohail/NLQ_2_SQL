@@ -30,6 +30,12 @@ interface Agent {
   trained_at?: string;
 }
 
+interface Favorite {
+  id: number;
+  name: string;
+  created_at?: string;
+}
+
 const Chat: React.FC = () => {
   const USER_ID = "demo-user-123";
   
@@ -66,6 +72,13 @@ const Chat: React.FC = () => {
   const [loading, setLoading] = useState(false);
   const [feedback, setFeedback] = useState<string | null>(null);
   const [sessionId, setSessionId] = useState<string | null>(null);
+  // Favourites
+  const [favSubmitting, setFavSubmitting] = useState(false);
+  const [favMessage, setFavMessage] = useState<string | null>(null);
+  // Favourites list/search
+  const [favorites, setFavorites] = useState<Favorite[]>([]);
+  const [favFilter, setFavFilter] = useState("");
+  const [favLoading, setFavLoading] = useState(false);
 
   // History states
   const [conversations, setConversations] = useState<Conversation[]>([]);
@@ -110,6 +123,7 @@ const Chat: React.FC = () => {
   useEffect(() => {
     if (connected && selectedAgent) {
       loadConversationHistory();
+      loadFavorites();
     }
   }, [connected, selectedAgent]);
 
@@ -128,6 +142,22 @@ const Chat: React.FC = () => {
       setCurrentConversationIndex(-1);
     } catch (error) {
       console.error("Error loading conversation history:", error);
+    }
+  };
+
+  // Load favourite queries list
+  const loadFavorites = async () => {
+    if (!selectedAgent) return;
+    try {
+      setFavLoading(true);
+      const res = await fetch(`http://localhost:5000/api/favorites/${selectedAgent.id}`);
+      const data = await res.json();
+      const list = Array.isArray(data?.favorites) ? data.favorites : [];
+      setFavorites(list);
+    } catch (e) {
+      setFavorites([]);
+    } finally {
+      setFavLoading(false);
     }
   };
 
@@ -345,6 +375,86 @@ const Chat: React.FC = () => {
       setTimeout(() => setFeedback(null), 3000);
     } catch (err) {
       setFeedback("⚠️ Error sending feedback");
+    }
+  };
+
+  // Add current NLQ + generated SQL to favourites
+  const handleAddFavorite = async () => {
+    if (!selectedAgent || !response || !(response.sql?.trim()) || !question.trim()) {
+      setFavMessage("⚠️ Nothing to save");
+      setTimeout(() => setFavMessage(null), 2500);
+      return;
+    }
+
+    // Ask user for favourite name (required), default to NLQ (trim to 150)
+    const suggested = question ? question.slice(0, 150) : "Favourite";
+    const input = window.prompt("Enter favourite name", suggested);
+    if (input === null) {
+      setFavMessage("Cancelled");
+      setTimeout(() => setFavMessage(null), 1500);
+      return;
+    }
+    const favoriteName = (input || "").trim().slice(0, 150);
+    if (!favoriteName) {
+      setFavMessage("⚠️ Favourite name is required");
+      setTimeout(() => setFavMessage(null), 2500);
+      return;
+    }
+
+    setFavSubmitting(true);
+    try {
+      const res = await fetch("http://localhost:5000/api/qna", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          agent_id: selectedAgent.id,
+          question: question,                                                      // NLQ (will go to description in SP)
+          sql_query: isEditingSQL ? editedSQL : (response.sql || ""),             // SQL
+          answer_preview: response.answer || "",
+          user_id: USER_ID,
+          favorite_name: favoriteName                                              // prompt value -> favourite_name
+        })
+      });
+      const data = await res.json();
+      if (data?.success) {
+        setFavMessage("⭐ Added to favourites");
+        await loadFavorites();
+      } else {
+        setFavMessage("❌ Failed to add to favourites");
+      }
+    } catch (e:any) {
+      setFavMessage("❌ Error adding to favourites");
+    } finally {
+      setFavSubmitting(false);
+      setTimeout(() => setFavMessage(null), 2500);
+    }
+  };
+
+  const handleLoadFavorite = async (favoriteId: number) => {
+    try {
+      const res = await fetch(`http://localhost:5000/api/favorites/detail/${favoriteId}`);
+      const data = await res.json();
+      if (data?.success && data?.favorite) {
+        const fav = data.favorite;
+        const nlq = fav.description || "";
+        const favSql = fav.favorite_query || "";
+        setQuestion(nlq);
+        const result: QueryResult = {
+          answer: "Loaded from favourite",
+          sql: favSql,
+          data: { columns: [], rows: [] },
+        };
+        setResponse(result);
+        setEditedSQL(favSql);
+        setIsEditingSQL(false);
+        setIsQuestionEditable(true);
+      } else {
+        setFavMessage("⚠️ Failed to load favourite");
+        setTimeout(() => setFavMessage(null), 2500);
+      }
+    } catch (e:any) {
+      setFavMessage("❌ Error loading favourite");
+      setTimeout(() => setFavMessage(null), 2500);
     }
   };
 
@@ -989,6 +1099,66 @@ const Chat: React.FC = () => {
           )}
         </div>
 
+        {/* Favourites Section */}
+        <div style={{ padding: "20px", borderBottom: "1px solid #e8e8e8" }}>
+          <h4 style={{ margin: "0 0 12px 0", color: "#333" }}>⭐ Favourite Queries</h4>
+
+          {/* Search box (red box sketch) */}
+          <input
+            value={favFilter}
+            onChange={(e) => setFavFilter(e.target.value)}
+            placeholder="Search favourite by name..."
+            style={{
+              width: "100%",
+              padding: "10px",
+              border: "2px solid #e8e8e8",
+              borderRadius: "8px",
+              fontSize: "13px",
+              marginBottom: "12px"
+            }}
+          />
+
+          {/* List of favourites (black boxes sketch) */}
+          <div style={{ display: "flex", flexDirection: "column", gap: "8px", maxHeight: "220px", overflowY: "auto" }}>
+            {favLoading && (
+              <div style={{ fontSize: "12px", color: "#999" }}>Loading favourites...</div>
+            )}
+            {!favLoading && favorites
+              .filter(f => (f.name || "").toLowerCase().includes(favFilter.toLowerCase()))
+              .map(f => (
+                <button
+                  key={f.id}
+                  onClick={() => handleLoadFavorite(f.id)}
+                  title={f.name}
+                  style={{
+                    textAlign: "left",
+                    padding: "10px 12px",
+                    background: "#fafafa",
+                    border: "1px solid #e8e8e8",
+                    borderRadius: "8px",
+                    cursor: "pointer",
+                    fontSize: "13px"
+                  }}
+                  onMouseOver={(e) => (e.currentTarget.style.background = "#f0f0f0")}
+                  onMouseOut={(e) => (e.currentTarget.style.background = "#fafafa")}
+                >
+                  <div style={{ fontWeight: 600, color: "#444", whiteSpace: "nowrap", overflow: "hidden", textOverflow: "ellipsis" }}>
+                    {f.name}
+                  </div>
+                  {f.created_at && (
+                    <div style={{ fontSize: "11px", color: "#999" }}>
+                      {new Date(f.created_at).toLocaleString()}
+                    </div>
+                  )}
+                </button>
+              ))
+            }
+            {!favLoading && favorites.filter(f => (f.name || "").toLowerCase().includes(favFilter.toLowerCase())).length === 0 && (
+              <div style={{ fontSize: "12px", color: "#999" }}>No favourites found</div>
+            )}
+          </div>
+        </div>
+
         {/* Conversation History */}
         {conversations.length > 0 && (
           <div style={{ flex: 1, padding: "20px", overflowY: "auto" }}>
@@ -1228,7 +1398,24 @@ const Chat: React.FC = () => {
                   <h3 style={{ margin: "0 0 12px 0", color: "#1890ff", fontSize: "16px" }}>
                     Generated SQL Query
                   </h3>
-                  <div style={{ display: "flex", gap: "8px" }}>
+                  <div style={{ display: "flex", gap: "8px", alignItems: "center" }}>
+                    <button
+                      onClick={handleAddFavorite}
+                      disabled={favSubmitting || !(response?.sql)}
+                      title="Add this NLQ + SQL to favourites"
+                      style={{
+                        padding: "6px 12px",
+                        background: "#faad14",
+                        color: "white",
+                        border: "none",
+                        borderRadius: "6px",
+                        cursor: (favSubmitting || !(response?.sql)) ? "not-allowed" : "pointer",
+                        fontWeight: "600",
+                        fontSize: "12px"
+                      }}
+                    >
+                      {favSubmitting ? "Saving..." : "☆ Add to Favourites"}
+                    </button>
                     <button
                       onClick={() => setIsEditingSQL(!isEditingSQL)}
                       style={{
@@ -1264,6 +1451,15 @@ const Chat: React.FC = () => {
                     )}
                   </div>
                 </div>
+                {favMessage && (
+                  <div style={{
+                    marginTop: "8px",
+                    fontSize: "12px",
+                    color: favMessage.startsWith("⭐") ? "#389e0d" : "#cf1322"
+                  }}>
+                    {favMessage}
+                  </div>
+                )}
                 {!isEditingSQL ? (
                   <pre style={{
                     background: "#f6f8fa",
