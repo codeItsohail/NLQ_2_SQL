@@ -43,42 +43,62 @@ except Exception:
 
 # SQL Server connection string builder (moved from utils)
 def build_sqlserver_connection_string(
-    host: str, 
-    port: Optional[int], 
-    database: str, 
-    username: str, 
-    password: str, 
+    host: str,
+    port: Optional[int],
+    database: str,
+    username: str,
+    password: str,
     use_sqlalchemy: bool = False
 ) -> str:
     """
     Build SQL Server connection string for both pyodbc and SQLAlchemy formats.
+    Notes:
+      - pyodbc placeholders are '?' and ODBC connection string values must be escaped
+        when they contain semicolons or braces. We wrap values with {} and escape '}'.
+      - Azure SQL requires Encrypt=yes; TrustServerCertificate=no.
+      - ODBC keyword is LoginTimeout (not Connection Timeout) for login timeouts.
     """
     port = port or 1433
-    
+
+    # Helper to escape ODBC values with braces for special characters like ';' or '}'
+    def _odbc_escape(val: Optional[str]) -> str:
+        if val is None:
+            return ""
+        return "{" + str(val).replace("}", "}}") + "}"
+
     if use_sqlalchemy:
-        # SQLAlchemy format for Vanna
-        encoded_username = urllib.parse.quote(username, safe="")
-        encoded_password = urllib.parse.quote_plus(password)
-        
+        # SQLAlchemy URL format (driver params are passed via query string)
+        # Ensure Azure SQL user format user@servername when needed
+        azure_user = (username or "")
+        if (host or "").endswith(".database.windows.net") and ".public." not in (host or "").lower() and azure_user and ("@" not in azure_user):
+            azure_user = f"{azure_user}@{(host or '').split('.', 1)[0]}"
+        encoded_username = urllib.parse.quote(azure_user, safe="")
+        encoded_password = urllib.parse.quote_plus(password or "")
+        db_segment = urllib.parse.quote(database or "", safe="")
         conn_str = (
-            f"mssql+pyodbc://{encoded_username}:{encoded_password}@{host}:{port}/{database}"
+            f"mssql+pyodbc://{encoded_username}:{encoded_password}@{host}:{port}/{db_segment}"
             f"?driver=ODBC+Driver+17+for+SQL+Server"
             f"&Encrypt=yes"
-            f"&TrustServerCertificate=yes"
-            f"&Connection+Timeout=30"
+            f"&TrustServerCertificate=no"
         )
         return conn_str
     else:
-        # Direct pyodbc connection string
+        # Direct pyodbc connection string (escape values safely)
+        # For Azure SQL, prefix SERVER with tcp:
+        server = host or ""
+        server_part = f"tcp:{server},{port}"
+        # Ensure Azure SQL user format user@servername when needed
+        azure_user = (username or "")
+        if (host or "").endswith(".database.windows.net") and ".public." not in (host or "").lower() and azure_user and ("@" not in azure_user):
+            azure_user = f"{azure_user}@{(host or '').split('.', 1)[0]}"
         conn_str = (
             f"DRIVER={{ODBC Driver 17 for SQL Server}};"
-            f"SERVER={host},{port};"
-            f"DATABASE={database};"
-            f"UID={username};"
-            f"PWD={password};"
+            f"SERVER={server_part};"
+            f"DATABASE={_odbc_escape(database)};"
+            f"UID={_odbc_escape(azure_user)};"
+            f"PWD={_odbc_escape(password)};"
             f"Encrypt=yes;"
-            f"TrustServerCertificate=yes;"
-            f"Connection Timeout=30;"
+            f"TrustServerCertificate=no;"
         )
         return conn_str
 
@@ -223,9 +243,13 @@ def test_connection(data: ConnectionData):
 def build_db_url(dbtype: str, host: str, port: int, dbname: str, user: str, password: str) -> str:
     dbtype = dbtype.lower()
     if dbtype == "sqlserver":
+        # Ensure Azure SQL user format user@servername when needed
+        azure_user = user or ""
+        if (host or "").endswith(".database.windows.net") and azure_user and ("@" not in azure_user):
+            azure_user = f"{azure_user}@{(host or '').split('.', 1)[0]}"
         # SQLAlchemy + pyodbc URL
         return (
-            f"mssql+pyodbc://{quote_plus(user)}:{quote_plus(password)}"
+            f"mssql+pyodbc://{quote_plus(azure_user)}:{quote_plus(password)}"
             f"@{host}:{port}/{dbname}?driver=ODBC+Driver+17+for+SQL+Server"
         )
     elif dbtype in ["postgres", "postgresql"]:
@@ -320,25 +344,40 @@ def set_vanna_collection(v, agent_id: str):
         v.config = {**getattr(v, "config", {}), "persist_directory": CHROMA_DIR}
 
 def parse_db_url(db_url: str):
-    """Enhanced URL parsing with SQL Server support"""
+    """Enhanced URL parsing with SQL Server support and proper URL-decoding.
+    - For mssql/sqlserver URLs, decode percent-encoded user/password/db before handing to ODBC.
+    - For all URLs, return a normalized dict with scheme, host, port, user, password, db.
+    """
     if db_url.startswith("sqlserver://"):
-        # Handle custom sqlserver:// format
+        # Normalize to mssql:// for parsing
         u = urlparse(db_url.replace("sqlserver://", "mssql://"))
         return dict(
-            scheme="sqlserver", host=u.hostname, port=u.port or 1433,
-            user=u.username, password=u.password, db=u.path.lstrip("/")
+            scheme="sqlserver",
+            host=u.hostname,
+            port=u.port or 1433,
+            user=urllib.parse.unquote(u.username or "") if u.username else None,
+            password=urllib.parse.unquote(u.password or "") if u.password else None,
+            db=urllib.parse.unquote(u.path.lstrip("/") or "") if u.path else None,
         )
     elif db_url.startswith("mssql"):
         u = urlparse(db_url)
         return dict(
-            scheme="sqlserver", host=u.hostname, port=u.port or 1433,
-            user=u.username, password=u.password, db=u.path.lstrip("/")
+            scheme="sqlserver",
+            host=u.hostname,
+            port=u.port or 1433,
+            user=urllib.parse.unquote(u.username or "") if u.username else None,
+            password=urllib.parse.unquote(u.password or "") if u.password else None,
+            db=urllib.parse.unquote(u.path.lstrip("/") or "") if u.path else None,
         )
     else:
         u = urlparse(db_url.replace("postgres://", "postgresql://"))
         return dict(
-            scheme=u.scheme, host=u.hostname, port=u.port,
-            user=u.username, password=u.password, db=u.path.lstrip("/")
+            scheme=u.scheme,
+            host=u.hostname,
+            port=u.port,
+            user=urllib.parse.unquote(u.username or "") if u.username else None,
+            password=urllib.parse.unquote(u.password or "") if u.password else None,
+            db=urllib.parse.unquote(u.path.lstrip("/") or "") if u.path else None,
         )
 
 def connect_target(db_url: str):
@@ -355,10 +394,27 @@ def connect_target(db_url: str):
     elif p["scheme"] == "sqlserver":
         if pyodbc_driver is None:
             raise RuntimeError("pyodbc not available")
-        conn_str = build_sqlserver_connection_string(
-            p["host"], p["port"], p["db"], p["user"], p["password"], use_sqlalchemy=False
-        )
-        return pyodbc_driver.connect(conn_str, timeout=10)
+        host = p.get("host") or ""
+        user = p.get("user") or ""
+        dbname = p.get("db") or ""
+        password = p.get("password") or ""
+        # First attempt with provided username
+        try:
+            conn_str = build_sqlserver_connection_string(
+                host, p["port"], dbname, user, password, use_sqlalchemy=False
+            )
+            return pyodbc_driver.connect(conn_str, timeout=10)
+        except Exception as e:
+            msg = str(e)
+            # Azure SQL fallback: try user@servername on 18456/28000
+            if host.endswith(".database.windows.net") and ".public." not in host.lower() and "28000" in msg and "18456" in msg and "@" not in user:
+                server_name = host.split(".", 1)[0]
+                alt_user = f"{user}@{server_name}" if user else user
+                conn_str2 = build_sqlserver_connection_string(
+                    host, p["port"], dbname, alt_user, password, use_sqlalchemy=False
+                )
+                return pyodbc_driver.connect(conn_str2, timeout=10)
+            raise
     raise ValueError(f"Unsupported scheme: {p['scheme']}")
 
 def get_vanna_connection_string(db_url: str) -> str:
@@ -448,7 +504,7 @@ def info_schema_text(db_url: str, db_type: str = None) -> str:
             """)
         elif p["scheme"] == "sqlserver":
             cur.execute("""
-              SELECT 
+              SELECT
                 SCHEMA_NAME(t.schema_id) as table_schema,
                 t.name as table_name,
                 c.name as column_name,
@@ -456,7 +512,7 @@ def info_schema_text(db_url: str, db_type: str = None) -> str:
               FROM sys.tables t
               INNER JOIN sys.columns c ON t.object_id = c.object_id
               INNER JOIN sys.types ty ON c.user_type_id = ty.user_type_id
-              WHERE SCHEMA_NAME(t.schema_id) = %s
+              WHERE SCHEMA_NAME(t.schema_id) = ?
               ORDER BY t.name, c.column_id
             """, (default_schema,))
         rows = cur.fetchall()
